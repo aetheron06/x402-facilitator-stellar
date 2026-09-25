@@ -14,16 +14,25 @@ import { installHorizonClient } from './horizon-client.js';
 import { installRpcRetry } from './rpc-retry.js';
 import { createRequestLog } from './log.js';
 import { createMetrics } from './metrics.js';
+import { createIpPseudonymizer, deriveIpHashSecret } from './ip.js';
+import { installProcessErrorHandlers } from './process-handlers.js';
 import { RateLimiter } from './rate-limit.js';
 import { createRateLimitStore, MemoryStore } from './rate-limit-store.js';
 import { RedisRateLimiter } from './redis-rate-limit.js';
 import { CrdtRateLimitStore } from './crdt-rate-limit-store.js';
 import { createDistributedLock } from './distributed-lock.js';
 import { buildIdempotencyStore } from './idempotency.js';
-import { MemoryCatalogStore } from './catalog/memory.js';
+import { buildCatalogStore } from './catalog/postgres.js';
 import { createWebhookDispatcher } from './webhooks/dispatcher.js';
 import { FailoverHealthChecker } from './failover-health.js';
+import { initTracing } from './tracing.js';
 import { createApp } from './app.js';
+import { buildSettlementStore } from './store/index.js';
+import { startReconciliationLoop } from './store/reconciliation.js';
+import { startOutboxWorker } from './outbox/index.js';
+import { createVaultManagedDatabase } from './vault/index.js';
+import { DeadLetterStore } from './dlq/store.js';
+import { startDlqWorker } from './dlq/worker.js';
 
 // A .env file is a development convenience, not a deployment mechanism — in
 // production the environment comes from the orchestrator, so a stray .env left
@@ -33,6 +42,11 @@ if (process.env.NODE_ENV !== 'production') {
   dotenv.config({ quiet: true });
 }
 
+// OpenTelemetry tracing: must run BEFORE installHorizonClient /
+// installRpcRetry so the undici instrumentation patches the npm `undici` client they
+// dial through, and before the http server starts so inbound span + traceparent
+// extraction are live for every request. No-op (returns null) when TRACING_ENABLED=false.
+const otel = initTracing();
 // Must run BEFORE installRpcRetry: the retry wrapper composes on top of
 // whatever fetch is global when it installs. Innermost first — pooled sockets
 // and the per-origin breaker (#120) sit under connection-level retries and the
@@ -48,10 +62,25 @@ const metrics = createMetrics();
 const rpc = installRpcRetry({
   log: msg => console.warn(`  ${msg}`),
   onStateChange: msg => console.warn(`  [Breaker] ${msg}`),
-  onRetry: ({ code }) => metrics.incRpcRetry({ code }),
+  onRetry: ({ code, host }) => metrics.incRpcRetry({ code, host }),
 });
 
 const config = resolveConfig();
+
+// Process-level error handlers (#205). Without these a listen failure or a
+// stray rejection killed the process with no diagnostic at all. Installed
+// before any listener is bound so a boot failure is attributable.
+installProcessErrorHandlers(process, {
+  log: msg => console.error(msg),
+});
+
+// #204: keyed IP pseudonymisation. IP_HASH_SECRET wins when set; otherwise the
+// key is derived from the (already secret) facilitator signer, so the default
+// deployment pseudonymises addresses with no new configuration. A bare config
+// cannot reach here — resolveConfig() above requires a signer secret.
+const ipPseudonymizer = createIpPseudonymizer({
+  secret: config.ipHashSecret ?? deriveIpHashSecret(config.perNetwork[config.networks[0]]?.secret),
+});
 
 // Vault-managed database pool (#127): when VAULT_ADDR is set, Postgres
 // credentials come from Vault's database secrets engine (AppRole login, lease
@@ -111,7 +140,23 @@ if (config.rateLimitStore === 'crdt' && config.databaseUrl) {
   });
   rateLimiter = new RateLimiter(config.rateLimits, rateLimitStore);
 }
-const catalog = new MemoryCatalogStore(config);
+const catalog = buildCatalogStore(config, {
+  log: msg => console.warn(`  ${msg}`),
+  pool: vaultDatabase?.pool,
+});
+// Off the hot path: a periodic sweep physically removes expired provisional
+// (verify-only) listings so they do not accumulate forever (#140).
+const catalogPruneTimer =
+  config.catalogVerifyTtlMs > 0
+    ? globalThis.setInterval(
+        () => {
+          catalog
+            .pruneExpired()
+            .catch(err => console.warn(`[Catalog] prune sweep failed: ${err.message}`));
+        },
+        Math.min(config.catalogVerifyTtlMs, 60_000),
+      )
+    : null;
 const idempotency = buildIdempotencyStore(config, { pool: vaultDatabase?.pool });
 
 // Cross-process serialization for state transitions (#116). Absent config
@@ -119,15 +164,6 @@ const idempotency = buildIdempotencyStore(config, { pool: vaultDatabase?.pool })
 const distributedLock = config.redisNodes.length
   ? createDistributedLock({ nodes: config.redisNodes })
   : null;
-
-// Webhook delivery off the critical path (#117).
-const webhooks = await createWebhookDispatcher({
-  brokers: config.kafka.brokers,
-  clientId: config.kafka.clientId,
-  topic: config.kafka.topic,
-  groupId: config.kafka.groupId,
-  url: config.webhookUrl,
-});
 
 // Multi-region failover health (#126).
 const failoverHealth = config.region
@@ -138,12 +174,38 @@ const failoverHealth = config.region
       log: msg => console.log(`  ${msg}`),
     })
   : null;
-import { buildSettlementStore } from './store/index.js';
-import { startReconciliationLoop } from './store/reconciliation.js';
-import { startOutboxWorker } from './outbox/index.js';
-import { createVaultManagedDatabase } from './vault/index.js';
 const settlementStore = buildSettlementStore(config, { pool: vaultDatabase?.pool });
 const reconciliation = startReconciliationLoop(settlementStore, config);
+
+// Dead-letter queue (#DLQ): built ahead of the webhook dispatcher and the
+// outbox worker so both can be handed the same store — a message dead-letters
+// from whichever path exhausts its delivery budget first, and the operator
+// API (registered in createApp below) reads them all from one place. Only
+// built when there is somewhere durable to put it (Postgres). Uses the
+// Vault-managed pool when one exists; otherwise opens its own, the same
+// lazy-per-store pattern PostgresIdempotencyStore and the catalog store use
+// (rather than reaching into settlementStore's pool, which is itself built
+// asynchronously and is not guaranteed to exist yet at this point).
+const dlqPool = config.databaseUrl
+  ? (vaultDatabase?.pool ??
+    (await import('pg').then(({ default: pg }) => {
+      const p = new pg.Pool({ connectionString: config.databaseUrl, max: 5 });
+      p.on('error', err => console.warn(`[DLQ] pool error: ${err.message}`));
+      return p;
+    })))
+  : null;
+const dlqStore = dlqPool ? new DeadLetterStore(dlqPool, { warn: msg => console.warn(msg) }) : null;
+
+// Webhook delivery off the critical path (#117).
+const webhooks = await createWebhookDispatcher({
+  brokers: config.kafka.brokers,
+  clientId: config.kafka.clientId,
+  topic: config.kafka.topic,
+  groupId: config.kafka.groupId,
+  dlqTopic: config.kafka.dlqTopic,
+  dlq: dlqStore,
+  url: config.webhookUrl,
+});
 
 // Transactional outbox (#123): the settle path writes the notification in the
 // same transaction as the 'settled' state change (see app.js); this worker
@@ -158,30 +220,62 @@ const outboxWorker =
         outbox,
         publish: record => webhooks.publish(record),
         intervalMs: config.outboxPollIntervalMs,
+        dlq: dlqStore,
         log: msg => console.warn(msg),
       })
     : null;
 outboxWorker?.start();
 
-const app = createApp(config, facilitator, rateLimiter, catalog, idempotency, {
+// DLQ retry worker (#DLQ): a second, slower backoff against the same
+// receiver for messages that exhausted their original delivery budget (see
+// src/dlq/worker.js). Also owns the depth-alert check and the
+// x402_dlq_depth gauge. Runs only when there is a DLQ store and something to
+// redeliver through.
+const dlqWorker =
+  dlqStore && typeof webhooks.publish === 'function'
+    ? startDlqWorker({
+        dlq: dlqStore,
+        publish: record => webhooks.publish(record),
+        intervalMs: config.dlq.pollIntervalMs,
+        maxDlqAttempts: config.dlq.maxRetryAttempts,
+        baseBackoffMs: config.dlq.baseBackoffMs,
+        alertThreshold: config.dlq.alertThreshold,
+        onDepth: ({ status, value }) => metrics.setDlqDepth({ status, value }),
+        log: msg => console.warn(msg),
+      })
+    : null;
+dlqWorker?.start();
+
+const app = await createApp(config, facilitator, rateLimiter, catalog, idempotency, {
   breakerStates: rpc?.getBreakerStates,
   distributedLock,
   webhooks,
   logger: createRequestLog({ level: config.logLevel }),
   metrics,
   signers,
+  ipPseudonymizer,
   // When METRICS_PORT is set the metrics listener below owns /metrics; keep it
   // off the public listener so it cannot be scraped by untrusted callers.
   serveMetrics: config.metricsPort == null,
 
   failoverHealth,
   settlementStore,
+  dlq: dlqStore
+    ? {
+        store: dlqStore,
+        publish: record => webhooks.publish(record),
+        retryOptions: {
+          maxDlqAttempts: config.dlq.maxRetryAttempts,
+          baseBackoffMs: config.dlq.baseBackoffMs,
+        },
+      }
+    : null,
 });
 
 // Set by the METRICS_PORT branch below; closed on shutdown when present.
 let metricsServerRef = null;
 
-app.listen({ port: config.port, host: '0.0.0.0' }, () => {
+function onListening() {
   console.log(`x402 Stellar facilitator listening on :${config.port}`);
   console.log(`  networks : ${config.networks.join(', ')}`);
   for (const network of config.networks) {
@@ -218,6 +312,7 @@ app.listen({ port: config.port, host: '0.0.0.0' }, () => {
       webhooks.kind === 'kafka'
         ? `kafka webhooks (${config.kafka.brokers.length} broker(s))`
         : 'direct webhooks',
+      dlqStore ? 'dlq enabled' : 'dlq disabled (no DATABASE_URL)',
       config.region ? `region: ${config.region}` : null,
     ]
       .filter(Boolean)
@@ -255,9 +350,24 @@ app.listen({ port: config.port, host: '0.0.0.0' }, () => {
     metricsServer.listen(config.metricsPort, '0.0.0.0', () => {
       console.log(`metrics listening on :${config.metricsPort} (METRICS_PORT)`);
     });
+    // #205: a metrics-listener bind failure must not be a silent death either.
+    metricsServer.on('error', err => {
+      console.error(`[Fatal] metrics listener failed on :${config.metricsPort}: ${err.message}`);
+      process.exit(1);
+    });
     // Track for graceful shutdown.
     metricsServerRef = metricsServer;
   }
+}
+
+// #205: a bind failure (EADDRINUSE, an unavailable port) is reported and the
+// process exits non-zero instead of dying with an unhandled 'error' event.
+app.listen({ port: config.port, host: '0.0.0.0' }, err => {
+  if (err) {
+    console.error(`[Fatal] failed to listen on :${config.port}: ${err.message}`);
+    process.exit(1);
+  }
+  onListening();
 });
 
 /**
@@ -276,19 +386,38 @@ async function shutdown(signal) {
   const shutdownPromise = (async () => {
     try {
       reconciliation?.stop();
+
+      failoverHealth?.stop();
+      await app.close();
+      await webhooks.stop().catch(() => {});
+      await distributedLock?.quit().catch(() => {});
+      await crdtStore?.close().catch(() => {});
+
       await outboxWorker?.stop();
+      await dlqWorker?.stop();
+      // Only end the DLQ pool if it is not the Vault-managed one — that pool
+      // is closed by vaultDatabase.stop() below, and ending it twice throws.
+      if (dlqPool && dlqPool !== vaultDatabase?.pool) {
+        await dlqPool.end().catch(() => {});
+      }
       await vaultDatabase?.stop();
       await app.close();
+
+      await otel?.shutdown().catch(() => {});
+
       await new Promise(resolve =>
         metricsServerRef ? metricsServerRef.close(resolve) : resolve(),
       );
-      await webhooks.stop().catch(() => {});
-      await distributedLock?.quit()?.catch(() => {});
-      await crdtStore?.close().catch(() => {});
 
+      await webhooks.stop().catch(() => {});
+      await distributedLock?.quit().catch(() => {});
+      await crdtStore?.close().catch(() => {});
       failoverHealth?.stop();
 
+      if (catalogPruneTimer) globalThis.clearInterval(catalogPruneTimer);
+
       await rateLimiter?.close?.().catch(() => {});
+
       horizon.restore();
     } catch (err) {
       console.error(`Error during shutdown: ${err.message}`);

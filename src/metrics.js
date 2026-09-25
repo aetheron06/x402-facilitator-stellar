@@ -14,6 +14,8 @@
  *   x402_settlement_fee_stroops histogram{network}
  *   x402_rpc_retries_total{code}
  *   x402_signer_inflight{network,signer}
+ *   x402_dlq_depth{status} - dead-letter queue depth; alert if pending+exhausted
+ *     exceeds DLQ_ALERT_THRESHOLD (see src/dlq/worker.js)
  */
 
 const DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
@@ -125,6 +127,18 @@ class Gauge {
     this.series.set(key, { labels: { ...labels }, value });
   }
 
+  inc(labels = {}, value = 1) {
+    const key = labelKey(labels);
+    const current = this.series.get(key)?.value ?? 0;
+    this.set(labels, current + value);
+  }
+
+  dec(labels = {}, value = 1) {
+    const key = labelKey(labels);
+    const current = this.series.get(key)?.value ?? 0;
+    this.set(labels, Math.max(0, current - value));
+  }
+
   render() {
     let out = `# HELP ${this.name} ${this.help}\n# TYPE ${this.name} gauge\n`;
     for (const { labels, value } of this.series.values()) {
@@ -166,13 +180,25 @@ export function createMetrics() {
   const rpcRetries = new Counter(
     'x402_rpc_retries_total',
     'Soroban RPC connection-level retries by error code.',
-    ['code'],
+    ['code', 'host'],
   );
   const signerInflight = new Gauge(
     'x402_signer_inflight',
     'In-flight settlements per signer — the sequence-contention signal (#9).',
     ['network', 'signer'],
   );
+  const dlqDepth = new Gauge(
+    'x402_dlq_depth',
+    'Dead-letter queue depth by status (pending, exhausted). Alert when pending+exhausted exceeds DLQ_ALERT_THRESHOLD.',
+    ['status'],
+  );
+
+  const activeVerifications = new Gauge(
+    'active_verifications',
+    'Verifies currently in flight — the scale signal the HPA reads through the Prometheus Adapter (#118).',
+    [],
+  );
+  activeVerifications.set({}, 0);
 
   return {
     incRequests: labels => requests.inc(labels),
@@ -180,12 +206,25 @@ export function createMetrics() {
       duration.observe({ route, network }, durationSeconds),
     incSettlements: labels => settlements.inc(labels),
     observeSettlementFee: ({ network, feeStroops }) => fee.observe({ network }, feeStroops),
-    incRpcRetry: ({ code }) => rpcRetries.inc({ code: code ?? 'unknown' }),
+    incRpcRetry: ({ code, host }) =>
+      rpcRetries.inc({ code: code ?? 'unknown', host: host ?? 'unknown' }),
     setSignerInflight: ({ network, signer, value }) =>
       signerInflight.set({ network, signer }, value),
+    setDlqDepth: ({ status, value }) => dlqDepth.set({ status }, value),
+    incActiveVerifications: () => activeVerifications.inc({}),
+    decActiveVerifications: () => activeVerifications.dec({}),
 
     render: () =>
-      [requests, duration, settlements, fee, rpcRetries, signerInflight]
+      [
+        requests,
+        duration,
+        settlements,
+        fee,
+        rpcRetries,
+        signerInflight,
+        dlqDepth,
+        activeVerifications,
+      ]
         .map(m => m.render())
         .join(''),
   };

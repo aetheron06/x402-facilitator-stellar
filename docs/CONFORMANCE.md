@@ -9,6 +9,60 @@ the upstream one cannot.
 This document records how that suite is invoked, what it requires, and what it
 found. It is the artifact; the CI job is the automation that keeps it honest.
 
+<!-- conformance-facilitator-sha: 8c7ccfc -->
+<!-- conformance-anchor-date: 2026-08-26 -->
+<!-- conformance-staleness-threshold: 50 -->
+
+> **Staleness anchor.** The two HTML comments above record the facilitator commit
+> this report was last reconciled against (`conformance-facilitator-sha`), the
+> date that reconciliation happened (`conformance-anchor-date`), and how many
+> commits main is allowed to advance past it before CI fails the report as stale
+> (`conformance-staleness-threshold`). They are parsed by
+> `scripts/check-conformance-staleness.mjs` — keep the key names exactly as
+> written. When you refresh this report, update the SHA to the current `main`
+> HEAD and the date; that resets the counter.
+
+---
+
+## 0. What was run, exactly
+
+A conformance claim without versions is not reproducible. Everything in this
+report was produced by the following inputs — pin them before trusting the
+conclusions:
+
+| Input | Value |
+|---|---|
+| Facilitator commit that produced the settled txs | `71743e1` |
+| Report last reconciled against | `8c7ccfc` (`main`) on 2026-08-26 |
+| Date of the run recorded below | 2026-08-14 |
+| Network / scheme | `stellar:testnet` / `exact` |
+| Canonical client | `x402-foundation/x402` TypeScript `http/fetch` client, upstream `main` (unpinned at run time; the CI job now pins and records the upstream SHA) |
+| `@x402/stellar` (verify / settle — not reimplemented here) | declared `^2.21.0` (see `package.json`) |
+| `@x402/core` | declared `^2.21.0` |
+| `@x402/extensions` (bazaar) | declared `^2.23.0` |
+| `@stellar/stellar-sdk` | declared `^16.2.0` |
+
+The declared semver ranges are the versions the run resolved against; the locked
+resolutions live in `package-lock.json` and are what CI installs via `npm ci`.
+
+---
+
+## 0b. Settled transaction hashes (per network, per scheme)
+
+Clickable `stellar.expert` links a reviewer can verify independently. These are
+the canonical acceptance artifact — a published, settled, on-chain transaction
+hash is the thing a reviewer checks instead of this prose.
+
+| Network | Scheme | Transaction | Ledger | Settled |
+|---|---|---|---|---|
+| `stellar:testnet` | `exact` | [`5f1bd15a…5558`](https://stellar.expert/explorer/testnet/tx/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558) | 4134781 | 2026-08-14T08:15:33Z |
+| `stellar:testnet` | `exact` | [`ff798145…0590`](https://stellar.expert/explorer/testnet/tx/ff798145681ad66e20f39f60d91895e993bc8033bbc78847aa5ddf0ee1e70590) | 4134928 | 2026-08-14T08:27:49Z |
+| `stellar:pubnet` | `exact` | — | — | blocked on #17, see §4 |
+
+`pubnet` has no settled hash because this service is not yet deployed there
+([#17](https://github.com/accensa/x402-facilitator-stellar/issues/17)). A stale
+report with a missing row is honest; a report that invented one would not be.
+
 ---
 
 ## 1. Where the suite lives, and what shape it is
@@ -262,6 +316,93 @@ work or to upstream harness fixes is recorded rather than guessed: each run's
 artifact pins the facilitator commit and the upstream SHA, so a regression can be
 attributed the same way.
 
+### 2026-09-03 — `__check_auth` smart-account payers settle end to end (closes #13)
+
+`scripts/e2e.mjs` proves one payer shape: a classic ed25519 keypair. This run
+proves the other — a **custom Soroban account contract** implementing
+`__check_auth`, the shape agent wallets take when they carry a spending policy,
+and the case `ExactStellarScheme.verify` treats differently from a classic
+keypair.
+
+**Why a separate script rather than an extension of `e2e.mjs`:** the smart-account
+path needs a deployed contract account and a signing flow the classic script has
+no concept of (and cannot have — see the glue finding below), so bolting it onto
+the keypair script would thread a second, unrelated mode through every helper.
+`scripts/e2e-smart-account.mjs` shares the repo's conventions (self-funding
+friendbot accounts, spawns its own facilitator on a random port, one
+structured assertion per scenario) and reuses the *same* stock client and
+facilitator code paths the keypair run exercises — the thing under test is the
+payer credential type, not a second transport.
+
+Inputs pinned (same locked dependencies as every run here):
+
+| Input | Value |
+|---|---|
+| Command | `npm run e2e:smart-account` |
+| Fixture | `test/fixtures/smart_account.wasm` — contract source in `test/fixtures/smart-account/` (`Cargo.toml` pins `soroban-sdk 27.0.6`, the protocol line testnet runs today); build/deploy steps in its `README.md` |
+| `@stellar/stellar-sdk` | `^16.2.0` (locked) |
+| `@x402/stellar` (verify/settle) | `^2.23.0` (locked) |
+| Payer | deployed contract account (C-address) owning the transfer; three instances: no cap, cap `1,000,000` stroops, cap `500` stroops |
+| Asset / amount | XLM (SAC) / 1,000 stroops, facilitator-sponsored fee |
+
+Results:
+
+| Scenario | Outcome | Evidence |
+|---|---|---|
+| A — plain `__check_auth` account, no cap | payment **settled** | [`6ba91c91…f5ee3`](https://stellar.expert/explorer/testnet/tx/6ba91c91efce72f3db1ddb0537df80a3579657f33bf5843c802d85fccf5f5ee3) — payer `CAOTRZH4…EV7FO`, verified + settled by the facilitator |
+| B — spend cap 1,000,000 ≥ 1,000 price | payment **settled** | [`f5b5b8f3…fe88`](https://stellar.expert/explorer/testnet/tx/f5b5b8f31453ec3dff90c5d4fc860d2a828c3f306750fb2c1d372617b3cafe88) |
+| C — spend cap 500 < 1,000 price | **rejected, non-null reason** | stock client's own simulation refuses the authorization (`Error(Auth, InvalidAction)`), and the signed authorization sent straight to `/verify` is rejected with `invalid_exact_stellar_payload_simulation_failed`; the host diagnostics show `__check_auth` failing with `Error(Contract, #2)` — the fixture's `SpendCapExceeded` |
+
+Every scenario above runs the same facilitator `verify`/`settle` code a classic
+payer uses. The contract account's `__check_auth` is what authenticates the
+payment — the host invokes it during simulation (client side, at signing) and
+again during the facilitator's own verification simulation. A payment inside the
+cap settles; one over it carries a non-null rejection reason. That is the
+spend-policy story working end to end.
+
+#### Auth-entry shape: contract account vs classic keypair
+
+Observed on the signed payloads (scenario D of the script — identical code path,
+only the payer credential differs):
+
+| Field | Classic keypair payer | `__check_auth` contract payer |
+|---|---|---|
+| `credentialType` | `sorobanCredentialsAddress` | `sorobanCredentialsAddress` |
+| `rootInvocation` | `…XLM-SAC….transfer(scvAddress, scvAddress, scvI128)` | identical |
+| `address` (who signs) | `G…` ed25519 account | `C…` contract account |
+| `signature` | ed25519 signature ScVal (`scvVec`) | owner-key ed25519 signature ScVal (`scvVec`), verified *by the contract* |
+| What validates it | `verify` checks the ed25519 signature against the G-address directly | the host calls the C-address's `__check_auth`; failure surfaces as `invalid_exact_stellar_payload_simulation_failed` |
+
+The credential type is the same string; the *semantics* differ completely — a
+change upstream that breaks the contract-account dispatch while classic keypairs
+keep passing would be silent here, which is exactly the regression #13 exists to
+catch. This is the difference a future contributor needs to see.
+
+#### Glue finding: stock SDK signing for a C-address payer (reported upstream)
+
+The client-side scheme deviates from upstream in exactly one place, and it is a
+finding to file upstream rather than a patch to hide:
+
+- `AssembledTransaction.signAuthEntries` (the path `ExactStellarScheme`
+  `createPaymentPayload` signs through) converts the signer result with
+  `Buffer.from(...)` and then makes the SDK verify the signature against
+  `Keypair.fromPublicKey(payerAddress)` — an ed25519 decoder that **cannot
+  decode a C-address**. A contract-account payer therefore cannot be signed by
+  stock client code as written today.
+- The SDK's own documented extension point for signers that do not own an
+  ed25519 keypair is `authorizeEntry`'s `signatureScVal` return (see
+  `@stellar/stellar-sdk` base/auth.js), which skips the keypair check. The
+  conformance scheme subclasses the stock `ExactStellarClient`, mirrors its
+  ~45-line `createPaymentPayload` (Apache-2.0), and signs through that
+  extension point. Everything else — the x402 client, the 402/retry/settle wire
+  flow, the resource server and the facilitator — is untouched stock code.
+
+So: the client here is *not* unmodified stock SDK code, and the deviation is
+precisely the one the issue anticipated — driving a contract account needs a
+small amount of local glue that belongs upstream. The deviation is documented in
+`scripts/e2e-smart-account.mjs` and should be filed against the x402 / Stellar
+SDK as part of this work.
+
 ### 2026-08-12 — integration verified, payment path not yet exercised
 
 Run locally against `x402-foundation/x402@main`, Stellar family, testnet.
@@ -334,7 +475,7 @@ Current as of 2026-08-26.
 | Non-null reason on every rejection | ✅ | `test/app.test.js`, across four malformed-body shapes on both routes |
 | Settled tx hash published per network per scheme | 🟡 | testnet `exact` published across twenty scenarios above; pubnet pending funding (op-only, #17). #18 |
 | Bazaar listing accepted by a third-party client | ❌ | first attempt rejected `invalid_routeTemplate`, #65 |
-| `__check_auth` smart-account payer | ⬜ | #13 |
+| `__check_auth` smart-account payer | ✅ | contract account as payer settles end to end ([`6ba91c91…f5ee3`](https://stellar.expert/explorer/testnet/tx/6ba91c91efce72f3db1ddb0537df80a3579657f33bf5843c802d85fccf5f5ee3), [`f5b5b8f3…fe88`](https://stellar.expert/explorer/testnet/tx/f5b5b8f31453ec3dff90c5d4fc860d2a828c3f306750fb2c1d372617b3cafe88)); over-cap rejected with `invalid_exact_stellar_payload_simulation_failed`; fixture in `test/fixtures/smart-account/` (#13) |
 | Structured logs sufficient to diagnose a failure | ✅ | one structured line per request with redacted headers (`src/logger.js`), `audit` channel records, `/metrics`; observed working in the harness output since 2026-08-25 |
 | SEP-41 7-decimal amount handling, exact stroops | ✅ | `test/conformance-sep41-decimals.test.js` — 12 cases pinning exact stroop equality across boundary/truncation/rejection (#152) |
 | Ledger-expiry and replay wire behaviour | ✅ | `test/conformance-expiry-replay.test.js` — expired payloads rejected with machine-readable reasons; identical replays served from the settlement store, never double-submitted (#159) |
@@ -359,6 +500,43 @@ only inputs are a network connection and Node 22+; the accounts fund themselves.
 If you get a different result, that is a bug report worth filing — the README
 says a conformance failure is the most useful contribution to this repo, and it
 means it.
+
+ docs/conformance
+### 6a. Verify the settled transactions yourself (two read-only commands)
+
+You do not need to run the suite to trust the headline claim. These two commands
+hit Stellar's public Horizon API and report what the chain says — no clone, no
+account, no secret:
+
+```bash
+# Run 1 — was it settled, and was it successful?
+curl -s https://horizon-testnet.stellar.org/transactions/5f1bd15aec8ca3c6390689ed7fed82506f6c3d8eb8ed325a05a8b83974925558 \
+  | jq '{successful, ledger, created_at}'
+
+# Run 2 — same question, independent hash
+curl -s https://horizon-testnet.stellar.org/transactions/ff798145681ad66e20f39f60d91895e993bc8033bbc78847aa5ddf0ee1e70590 \
+  | jq '{successful, ledger, created_at}'
+```
+
+Both return `"successful": true`. For the same data through the explorer UI, open
+the `stellar.expert` links in §0b. Either path lets a third party confirm the
+transactions without asking us for anything.
+
+### 6b. Reproduce the full run
+
+```bash
+git clone --depth 1 https://github.com/x402-foundation/x402.git
+cd x402/e2e
+pnpm install:all
+mkdir -p facilitators/external-proxies/accensa
+cp /path/to/x402-facilitator-stellar/e2e/accensa-proxy/* facilitators/external-proxies/accensa/
+node /path/to/x402-facilitator-stellar/scripts/fund-testnet-accounts.mjs > .env
+echo "ACCENSA_FACILITATOR_DIR=/path/to/x402-facilitator-stellar" >> .env
+pnpm test --testnet --families=stellar --facilitators=accensa --min -v
+```
+
+The `conformance.yml` workflow runs this nightly and publishes the full output as
+an artifact, so the linked evidence in §4 is regenerated rather than asserted.
 
 ## 7. Post-grant maintenance commitment
 

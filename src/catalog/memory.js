@@ -7,11 +7,14 @@
  * passed to these methods. The catalog interface guarantees that limit and
  * offset are safe integers within acceptable bounds.
  */
-import { scoreResource } from './search.js';
+import { scoreResource, toEpochMillis } from './search.js';
 import { EmbeddingClient } from './embeddings.js';
 
 /** Stable reason code for the catalog-flooding guard (#186). */
 export const MAX_RESOURCES_PER_PAYTO_CODE = 'maximum_resources_per_payto_exceeded';
+
+/** Stable reason code for the overall catalog size limit (#224). */
+export const MAX_CATALOG_SIZE_CODE = 'maximum_catalog_size_exceeded';
 
 /** Typed catalog error with a stable code, surfaced identically on every path. */
 export class CatalogError extends Error {
@@ -44,6 +47,9 @@ export class MemoryCatalogStore {
     this.payToCounts = new Map();
     this.maxResourcesPerPayTo =
       config.maxResourcesPerPayTo ?? config.catalogMaxResourcesPerPayTo ?? 50;
+    // Overall catalog size limit (#224) to prevent unbounded growth.
+    this.maxCatalogSize = config.maxCatalogSize ?? config.catalogMaxSize ?? 10000;
+    this.verifyTtlMs = config.catalogVerifyTtlMs ?? 24 * 60 * 60 * 1000;
     this.embeddingClient = new EmbeddingClient(config.embeddingsUrl, {
       timeoutMs: config.embeddingsTimeoutMs,
     });
@@ -51,10 +57,41 @@ export class MemoryCatalogStore {
     // Track in-flight background embedding promises so callers can await
     // all of them via flush() instead of relying on a hardcoded sleep.
     this._pendingEmbeddings = new Set();
+    // Monotonic catalog version, bumped on every write (#200). It backs the
+    // weak ETag discovery responses emit, so a write invalidates every cached
+    // listing/search in one move. Starts at 0 (an untouched catalog).
+    this._version = 0;
+    this._lastModified = new Date(0);
+  }
+
+  /** Monotonic write counter — see #200. */
+  getVersion() {
+    return this._version;
+  }
+
+  /** Timestamp of the most recent write, for Last-Modified (#200). */
+  getLastModified() {
+    return this._lastModified;
   }
 
   _key(resource) {
     return resource.type === 'mcp' ? `${resource.url}::${resource.toolName}` : `${resource.url}::`;
+  }
+
+  /**
+   * A verify-only listing (`source: 'verify'`) is provisional: it is visible for
+   * discoverability but lacks the proof of a real payment, so once its window
+   * elapses it must stop being public. Settled and manual listings are never
+   * provisional (#140).
+   */
+  _isExpired(entry) {
+    if (!entry?.provisional) return false;
+    if (entry.expires_at == null) return true;
+    return Date.now() >= new Date(entry.expires_at).getTime();
+  }
+
+  _isPublic(entry) {
+    return !this._isExpired(entry);
   }
 
   _incrementPayToCount(payTo) {
@@ -82,6 +119,13 @@ export class MemoryCatalogStore {
           `maximum resources per payTo (${this.maxResourcesPerPayTo}) exceeded`,
         );
       }
+      // Overall catalog size limit (#224) to prevent unbounded growth.
+      if (this.resources.size >= this.maxCatalogSize) {
+        throw new CatalogError(
+          MAX_CATALOG_SIZE_CODE,
+          `maximum catalog size (${this.maxCatalogSize}) exceeded`,
+        );
+      }
     }
 
     const now = new Date();
@@ -93,10 +137,24 @@ export class MemoryCatalogStore {
       );
     }
 
+    // Provenance and lifetime (#140). A verify proves nothing was paid, so a
+    // listing it creates is provisional and expires unless a settlement
+    // promotes it. A listing created by a settle (or by hand) is permanent
+    // public state. A settle/manual write always promotes — even one landing
+    // on an old provisional entry — and never demotes an already-settled one.
+    const existingSettled = existing != null && existing.source !== 'verify';
+    const provisional = source === 'verify' && !existingSettled;
+    const expiresAt = provisional ? now.getTime() + this.verifyTtlMs : null;
+    // Provenance records how a listing entered the catalog: a verify touching
+    // an already-settled listing must not mask its permanent origin.
+    const recordedSource = existingSettled ? existing.source : source;
+
     const entry = {
       ...existing,
       ...resource,
-      source,
+      source: recordedSource,
+      provisional,
+      expires_at: expiresAt,
       last_seen_at: now,
       first_seen_at: existing ? existing.first_seen_at : now,
     };
@@ -106,26 +164,45 @@ export class MemoryCatalogStore {
       this._incrementPayToCount(resource.payTo);
     }
 
+    // A write is a write, overwrite or not: bump the monotonic version so every
+    // cached discovery response is invalidated (its weak ETag changes) in one
+    // move rather than being served stale until a TTL expires.
+    this._version += 1;
+    this._lastModified = now;
+
     // Re-embed asynchronously without blocking the upsert (or the payment path)
-    if (this.embeddingClient.url) {
-      const p = Promise.resolve().then(async () => {
-        try {
-          const text = this.embeddingClient.composeDocument(entry);
-          const vector = await this.embeddingClient.embed(text);
-          if (vector) {
-            entry.embedding = vector;
-          }
-        } catch (err) {
-          console.warn(`[Catalog] Failed to re-embed ${key}: ${err.message}`);
-        } finally {
-          this._pendingEmbeddings.delete(p);
-        }
-      });
-      this._pendingEmbeddings.add(p);
-    }
+    this._scheduleEmbed(entry);
 
     return entry;
   }
+
+  /**
+   * Re-embeds a resource in the background when an embedding provider is wired
+   * up, never blocking the upsert or the payment path. `_afterEmbedding` is a
+   * hook that durable stores override to persist the freshly-computed vector
+   * (#139) — the base implementation stores nothing.
+   */
+  _scheduleEmbed(entry) {
+    if (!this.embeddingClient.url) return;
+    const p = Promise.resolve().then(async () => {
+      try {
+        const text = this.embeddingClient.composeDocument(entry);
+        const vector = await this.embeddingClient.embed(text);
+        if (vector) {
+          entry.embedding = vector;
+          await this._afterEmbedding(entry);
+        }
+      } catch (err) {
+        console.warn(`[Catalog] Failed to re-embed ${this._key(entry)}: ${err.message}`);
+      } finally {
+        this._pendingEmbeddings.delete(p);
+      }
+    });
+    this._pendingEmbeddings.add(p);
+  }
+
+  /** Hook for durable stores to persist a freshly-computed embedding vector. */
+  async _afterEmbedding() {}
 
   /**
    * Await all in-flight background embedding requests.
@@ -139,12 +216,15 @@ export class MemoryCatalogStore {
 
   async getResource(url, toolName = null) {
     const key = toolName ? `${url}::${toolName}` : `${url}::`;
-    return this.resources.get(key) || null;
+    const entry = this.resources.get(key) || null;
+    return entry && this._isPublic(entry) ? entry : null;
   }
 
-  async listResources(params = {}) {
-    let items = Array.from(this.resources.values());
-
+  /**
+   * Applies the common filter set used by both listResources and search (#227).
+   * Extracted to eliminate duplication and ensure consistent filtering behavior.
+   */
+  _applyCommonFilters(items, params) {
     if (params.type) items = items.filter(r => r.type === params.type);
     if (params.payTo) items = items.filter(r => r.payTo === params.payTo);
     if (params.scheme) items = items.filter(r => r.scheme === params.scheme);
@@ -155,10 +235,19 @@ export class MemoryCatalogStore {
         return params.extensions.every(ext => resourceExts.includes(ext));
       });
     }
+    return items;
+  }
+
+  async listResources(params = {}) {
+    let items = Array.from(this.resources.values()).filter(item => this._isPublic(item));
+    items = this._applyCommonFilters(items, params);
 
     // Sort by first_seen_at desc, then key asc to ensure deterministic order
+    // Use toEpochMillis for safe conversion (#223) instead of assuming Date
     items.sort((a, b) => {
-      const timeDiff = b.first_seen_at.getTime() - a.first_seen_at.getTime();
+      const timeA = toEpochMillis(a.first_seen_at);
+      const timeB = toEpochMillis(b.first_seen_at);
+      const timeDiff = (timeB ?? 0) - (timeA ?? 0);
       if (timeDiff !== 0) return timeDiff;
       const keyA = this._key(a);
       const keyB = this._key(b);
@@ -177,19 +266,26 @@ export class MemoryCatalogStore {
     };
   }
 
-  async search(params) {
-    let items = Array.from(this.resources.values());
-
-    if (params.type) items = items.filter(r => r.type === params.type);
-    if (params.payTo) items = items.filter(r => r.payTo === params.payTo);
-    if (params.scheme) items = items.filter(r => r.scheme === params.scheme);
-    if (params.network) items = items.filter(r => r.network === params.network);
-    if (params.extensions && Array.isArray(params.extensions)) {
-      items = items.filter(r => {
-        const resourceExts = Object.keys(r.extensions || {});
-        return params.extensions.every(ext => resourceExts.includes(ext));
-      });
+  /**
+   * Physically removes expired provisional (verify-only) listings so they do
+   * not accumulate forever (#140). Called lazily by a background sweep rather
+   * than on the payment hot path. Returns the number of entries pruned.
+   */
+  async pruneExpired() {
+    let pruned = 0;
+    for (const [key, entry] of this.resources) {
+      if (this._isExpired(entry)) {
+        this.resources.delete(key);
+        this._decrementPayToCount(entry.payTo);
+        pruned += 1;
+      }
     }
+    return pruned;
+  }
+
+  async search(params) {
+    let items = Array.from(this.resources.values()).filter(item => this._isPublic(item));
+    items = this._applyCommonFilters(items, params);
 
     let partialResults = false;
     let queryVector = null;

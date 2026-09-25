@@ -7,11 +7,7 @@ services:
       - '${PORT:-3402}:3402'
     environment:
       - FACILITATOR_SECRET=${FACILITATOR_SECRET}
-      - DATABASE_URL=postgres://postgres:postgres@db:5432/x402_facilitator
-      # CQRS read replica (#121): status reads and the reconciliation sweep hit
-      # db-replica, writes stay on db. Set point read traffic grows without
-      # touching the primary that carries settlement submissions.
-      - DATABASE_URL_REPLICA=postgres://postgres:postgres@db-replica:5432/x402_facilitator
+      - DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-x402_facilitator}
       - REDIS_URL=redis://redis:6379
       # Redlock quorum (#116): three independent masters.
       - REDIS_NODES=redis://redis-node-1:6379,redis://redis-node-2:6379,redis://redis-node-3:6379
@@ -23,6 +19,9 @@ services:
       # keep the daily fee ceiling alive across restarts.
       - RATE_LIMIT_STORE=${RATE_LIMIT_STORE:-memory}
       - AUDIT_LOG_FILE=${AUDIT_LOG_FILE:-}
+      # Distributed tracing (#tracing): export spans to Jaeger's OTLP receiver.
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=x402-facilitator-stellar
     depends_on:
       db:
         condition: service_healthy
@@ -30,6 +29,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
       redis-node-1:
         condition: service_healthy
       redis-node-2:
@@ -99,18 +100,31 @@ services:
     volumes:
       - kafka_data:/bitnami/kafka
 
+  # Jaeger all-in-one (#tracing): receives OTLP/HTTP spans on 4318 and serves
+  # the UI on 16686. Local observability only — not for production.
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - '16686:16686'
+      - '4318:4318'
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
   db:
     image: postgres:16-alpine
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=x402_facilitator
-    ports:
-      - '5432:5432'
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      - POSTGRES_DB=${POSTGRES_DB:-x402_facilitator}
+    # Port is intentionally NOT published to the host — Postgres is only
+    # reachable from inside the compose network. Remove this comment and
+    # uncomment the block below only for local debugging:
+    # ports:
+    #   - '127.0.0.1:5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-postgres}']
       interval: 5s
       timeout: 5s
       retries: 5
@@ -124,18 +138,21 @@ services:
   db-replica:
     image: postgres:16-alpine
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - PGPASSWORD=postgres
-    ports:
-      - '5433:5432'
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      - PGPASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    # Not published to the host, for the same reason as the primary: the
+    # replica holds a byte-for-byte copy of the primary's data. Uncomment only
+    # for local debugging:
+    # ports:
+    #   - '127.0.0.1:5433:5432'
     command:
       - bash
       - -ec
       - |
         if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
           rm -rf /var/lib/postgresql/data
-          pg_basebackup -h db -U postgres -D /var/lib/postgresql/data -Fp -R -X stream
+          pg_basebackup -h db -U "$${POSTGRES_USER:-postgres}" -D /var/lib/postgresql/data -Fp -R -X stream
         fi
         exec docker-entrypoint.sh postgres
     volumes:
@@ -144,7 +161,7 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-postgres}']
       interval: 5s
       timeout: 5s
       retries: 5
